@@ -61,6 +61,7 @@ class LightningModule(lightning.LightningModule):
         load_ckpt_class_head=True,
         freeze_encoder: bool = False,
         freeze_encoder_except_last_n: int = 0,
+        freeze_all_except_head: bool = False,
     ):
         super().__init__()
 
@@ -107,6 +108,10 @@ class LightningModule(lightning.LightningModule):
         elif freeze_encoder:
             for param in self.network.encoder.parameters():
                 param.requires_grad_(False)
+        elif freeze_all_except_head:
+            for name, param in self.network.named_parameters():
+               if "class_head" not in name and "class_predictor" not in name:
+                   param.requires_grad_(False)
 
         self.log = torch.compiler.disable(self.log)  # type: ignore
 
