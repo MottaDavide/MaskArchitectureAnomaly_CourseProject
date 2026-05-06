@@ -1,5 +1,5 @@
 trainer:
-  max_epochs: 15
+  max_epochs: 30
   precision: 16-mixed
   logger:
     class_path: lightning.pytorch.loggers.wandb.WandbLogger
