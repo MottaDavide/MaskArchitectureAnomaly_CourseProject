@@ -1,6 +1,7 @@
 trainer:
   max_epochs: 30
   precision: 16-mixed
+  accumulate_grad_batches: 2 
   logger:
     class_path: lightning.pytorch.loggers.wandb.WandbLogger
     init_args:
@@ -11,6 +12,7 @@ trainer:
 model:
   class_path: training.mask_classification_semantic.MaskClassificationSemantic
   init_args:
+    img_size: [640, 640]
     attn_mask_annealing_enabled: False
     freeze_all_except_head: True
     ckpt_path: weights/eomt_coco.bin
@@ -29,3 +31,6 @@ model:
 
 data:
   class_path: datasets.cityscapes_semantic.CityscapesSemantic
+  init_args:
+    batch_size: 8 
+    img_size: [640, 640]
