@@ -6,8 +6,8 @@ trainer:
     class_path: lightning.pytorch.loggers.wandb.WandbLogger
     init_args:
       resume: allow
-      project: "eomt"
-      name: "coco_to_cityscapes_finetune"
+      project: "eomt_unzipped_images"
+      name: "coco_to_cityscapes_finetune_unzipped"
 
 model:
   class_path: training.mask_classification_semantic.MaskClassificationSemantic
