@@ -3,7 +3,6 @@
 # Licensed under the MIT License.
 # ---------------------------------------------------------------
 
-
 import re
 import json
 import zipfile
@@ -18,10 +17,81 @@ from torchvision import tv_tensors
 from torchvision.transforms.v2 import functional as F
 
 
+# ---------------------------------------------------------------------------
+# Thin abstraction: unifies zipfile.ZipFile and plain filesystem folder
+# so the rest of the code works identically for both.
+# ---------------------------------------------------------------------------
+
+class _FolderHandle:
+    """Mimics the zipfile.ZipFile interface but reads from a plain folder."""
+
+    def __init__(self, folder_root: Path):
+        self.folder_root = Path(folder_root)
+        self._names = None  # lazy
+
+    # ---- ZipFile-compatible helpers ----------------------------------------
+
+    def namelist(self) -> list[str]:
+        if self._names is None:
+            self._names = [
+                p.relative_to(self.folder_root).as_posix()
+                for p in self.folder_root.rglob("*")
+                if p.is_file()
+            ]
+        return self._names
+
+    def infolist(self) -> list["_FolderInfo"]:
+        return [_FolderInfo(n) for n in self.namelist()]
+
+    def open(self, name: str, mode: str = "r"):
+        return open(self.folder_root / name, "rb")
+
+    def close(self):
+        pass  # nothing to close
+
+
+class _FolderInfo:
+    """Mimics zipfile.ZipInfo for _FolderHandle.infolist()."""
+
+    def __init__(self, rel_posix: str):
+        self.filename = rel_posix
+
+    def is_dir(self) -> bool:
+        return False  # rglob already filters dirs out
+
+
+# ---------------------------------------------------------------------------
+# Factory: return either a ZipFile or a _FolderHandle
+# ---------------------------------------------------------------------------
+
+def _open_source(path: Optional[Path]) -> Optional[object]:
+    """
+    Given a path that can be:
+      • a .zip file  → return zipfile.ZipFile
+      • a directory  → return _FolderHandle
+      • None         → return None
+    Raises FileNotFoundError if the path exists in neither form.
+    """
+    if path is None:
+        return None
+    path = Path(path)
+    if path.is_dir():
+        return _FolderHandle(path)
+    if path.is_file() and zipfile.is_zipfile(path):
+        return zipfile.ZipFile(path)
+    raise FileNotFoundError(
+        f"Dataset source not found as zip or directory: {path}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main Dataset class — identical public API, now zip/folder agnostic
+# ---------------------------------------------------------------------------
+
 class Dataset(torch.utils.data.Dataset):
     def __init__(
         self,
-        zip_path: Path,
+        zip_path: Path,                          # kept for back-compat; can be a dir
         img_suffix: str,
         target_parser: Callable,
         check_empty_targets: bool,
@@ -31,7 +101,7 @@ class Dataset(torch.utils.data.Dataset):
         stuff_classes: Optional[list[int]] = None,
         img_stem_suffix: str = "",
         target_stem_suffix: str = "",
-        target_zip_path: Optional[Path] = None,
+        target_zip_path: Optional[Path] = None,  # can be a dir
         target_zip_path_in_zip: Optional[Path] = None,
         target_instance_zip_path: Optional[Path] = None,
         img_folder_path_in_zip: Path = Path("./"),
@@ -39,32 +109,37 @@ class Dataset(torch.utils.data.Dataset):
         target_instance_folder_path_in_zip: Path = Path("./"),
         annotations_json_path_in_zip: Optional[Path] = None,
     ):
-        self.zip_path = zip_path
+        # Store raw paths (may be zip files or directories)
+        self.zip_path = Path(zip_path)
+        self.target_zip_path = Path(target_zip_path) if target_zip_path else None
+        self.target_zip_path_in_zip = target_zip_path_in_zip
+        self.target_instance_zip_path = (
+            Path(target_instance_zip_path) if target_instance_zip_path else None
+        )
+
         self.target_parser = target_parser
         self.transforms = transforms
         self.only_annotations_json = only_annotations_json
         self.stuff_classes = stuff_classes
-        self.target_zip_path = target_zip_path
-        self.target_zip_path_in_zip = target_zip_path_in_zip
-        self.target_instance_zip_path = target_instance_zip_path
         self.target_folder_path_in_zip = target_folder_path_in_zip
         self.target_instance_folder_path_in_zip = target_instance_folder_path_in_zip
 
+        # Per-worker handles (populated lazily in _load_zips)
         self.zip = None
         self.target_zip = None
         self.target_instance_zip = None
-        img_zip, target_zip, target_instance_zip = self._load_zips()
+
+        # Open once for __init__ indexing, then release
+        img_src, target_src, target_instance_src = self._load_zips()
 
         self.labels_by_id = {}
         self.polygons_by_id = {}
         self.is_crowd_by_id = {}
 
         if annotations_json_path_in_zip is not None:
-            with zipfile.ZipFile(target_zip_path or zip_path) as outer_target_zip:
-                with outer_target_zip.open(
-                    str(annotations_json_path_in_zip), "r"
-                ) as file:
-                    annotation_data = json.load(file)
+            ann_src = _open_source(target_zip_path or zip_path)
+            with ann_src.open(str(annotations_json_path_in_zip), "r") as file:
+                annotation_data = json.load(file)
 
             image_id_to_file_name = {
                 image["id"]: image["file_name"] for image in annotation_data["images"]
@@ -85,30 +160,22 @@ class Dataset(torch.utils.data.Dataset):
                 else:
                     if img_filename not in self.labels_by_id:
                         self.labels_by_id[img_filename] = {}
-
                     if img_filename not in self.polygons_by_id:
                         self.polygons_by_id[img_filename] = {}
-
                     if img_filename not in self.is_crowd_by_id:
                         self.is_crowd_by_id[img_filename] = {}
 
-                    self.labels_by_id[img_filename][annotation["id"]] = annotation[
-                        "category_id"
-                    ]
-                    self.polygons_by_id[img_filename][annotation["id"]] = annotation[
-                        "segmentation"
-                    ]
-                    self.is_crowd_by_id[img_filename][annotation["id"]] = bool(
-                        annotation["iscrowd"]
-                    )
+                    self.labels_by_id[img_filename][annotation["id"]] = annotation["category_id"]
+                    self.polygons_by_id[img_filename][annotation["id"]] = annotation["segmentation"]
+                    self.is_crowd_by_id[img_filename][annotation["id"]] = bool(annotation["iscrowd"])
 
         self.imgs = []
         self.targets = []
         self.targets_instance = []
 
-        target_zip_filenames = target_zip.namelist()
+        target_src_filenames = target_src.namelist()
 
-        for img_info in sorted(img_zip.infolist(), key=self._sort_key):
+        for img_info in sorted(img_src.infolist(), key=self._sort_key):
             if not self.valid_member(
                 img_info, img_folder_path_in_zip, img_stem_suffix, img_suffix
             ):
@@ -119,43 +186,35 @@ class Dataset(torch.utils.data.Dataset):
                 rel_path = img_path.relative_to(img_folder_path_in_zip)
                 target_parent = target_folder_path_in_zip / rel_path.parent
                 target_stem = rel_path.stem.replace(img_stem_suffix, target_stem_suffix)
-
                 target_filename = (target_parent / f"{target_stem}{target_suffix}").as_posix()
 
             if self.labels_by_id:
                 if img_path.name not in self.labels_by_id:
                     continue
-
                 if not self.labels_by_id[img_path.name]:
                     continue
             else:
-                if target_filename not in target_zip_filenames:
+                if target_filename not in target_src_filenames:
                     continue
 
                 if check_empty_targets:
-                    with target_zip.open(target_filename) as target_file:
+                    with target_src.open(target_filename) as target_file:
                         min_val, max_val = Image.open(target_file).getextrema()
                         if min_val == max_val:
                             continue
 
-            if target_instance_zip is not None:
+            if target_instance_src is not None:
                 target_instance_filename = (
                     target_instance_folder_path_in_zip / (target_stem + target_suffix)
                 ).as_posix()
 
                 if check_empty_targets:
-                    with target_instance_zip.open(
-                        target_instance_filename
-                    ) as target_instance:
-                        extrema = Image.open(target_instance).getextrema()
-                        if all(min_val == max_val for min_val, max_val in extrema):
+                    with target_instance_src.open(target_instance_filename) as ti:
+                        extrema = Image.open(ti).getextrema()
+                        if all(mn == mx for mn, mx in extrema):
                             _, labels, _ = self.target_parser(
-                                target=tv_tensors.Mask(
-                                    Image.open(target_zip.open(target_filename))
-                                ),
-                                target_instance=tv_tensors.Mask(
-                                    Image.open(target_instance)
-                                ),
+                                target=tv_tensors.Mask(Image.open(target_src.open(target_filename))),
+                                target_instance=tv_tensors.Mask(Image.open(ti)),
                                 stuff_classes=self.stuff_classes,
                             )
                             if not labels:
@@ -166,18 +225,22 @@ class Dataset(torch.utils.data.Dataset):
             if not only_annotations_json:
                 self.targets.append(target_filename)
 
-            if target_instance_zip is not None:
+            if target_instance_src is not None:
                 self.targets_instance.append(target_instance_filename)
 
-    def __getitem__(self, index: int):
-        img_zip, target_zip, target_instance_zip = self._load_zips()
+    # -----------------------------------------------------------------------
+    # __getitem__
+    # -----------------------------------------------------------------------
 
-        with img_zip.open(self.imgs[index]) as img:
+    def __getitem__(self, index: int):
+        img_src, target_src, target_instance_src = self._load_zips()
+
+        with img_src.open(self.imgs[index]) as img:
             img = tv_tensors.Image(Image.open(img).convert("RGB"))
 
         target = None
         if not self.only_annotations_json:
-            with target_zip.open(self.targets[index]) as target_file:
+            with target_src.open(self.targets[index]) as target_file:
                 target = tv_tensors.Mask(Image.open(target_file), dtype=torch.long)
 
             if img.shape[-2:] != target.shape[-2:]:
@@ -189,12 +252,8 @@ class Dataset(torch.utils.data.Dataset):
 
         target_instance = None
         if self.targets_instance:
-            with target_instance_zip.open(
-                self.targets_instance[index]
-            ) as target_instance:
-                target_instance = tv_tensors.Mask(
-                    Image.open(target_instance), dtype=torch.long
-                )
+            with target_instance_src.open(self.targets_instance[index]) as ti:
+                target_instance = tv_tensors.Mask(Image.open(ti), dtype=torch.long)
 
         masks, labels, is_crowd = self.target_parser(
             target=target,
@@ -218,11 +277,17 @@ class Dataset(torch.utils.data.Dataset):
 
         return img, target
 
-    def _load_zips(
-        self,
-    ) -> Tuple[zipfile.ZipFile, zipfile.ZipFile, Optional[zipfile.ZipFile]]:
+    # -----------------------------------------------------------------------
+    # _load_zips  (now: _load_sources — same name kept for compatibility)
+    # -----------------------------------------------------------------------
+
+    def _load_zips(self) -> Tuple[object, object, Optional[object]]:
+        """
+        Returns per-worker source handles (zip or folder).
+        Handles are cached per worker id so each worker opens its own handle.
+        """
         worker = get_worker_info()
-        worker = worker.id if worker else None
+        worker_id = worker.id if worker else None
 
         if self.zip is None:
             self.zip = {}
@@ -231,43 +296,50 @@ class Dataset(torch.utils.data.Dataset):
         if self.target_instance_zip is None and self.target_instance_zip_path:
             self.target_instance_zip = {}
 
-        if worker not in self.zip:
-            self.zip[worker] = zipfile.ZipFile(self.zip_path)
-        if worker not in self.target_zip:
+        # --- image source ---
+        if worker_id not in self.zip:
+            self.zip[worker_id] = _open_source(self.zip_path)
+
+        # --- target source ---
+        if worker_id not in self.target_zip:
             if self.target_zip_path:
-                self.target_zip[worker] = zipfile.ZipFile(self.target_zip_path)
-                if self.target_zip_path_in_zip:
-                    with self.target_zip[worker].open(
-                        str(self.target_zip_path_in_zip)
-                    ) as target_zip_stream:
-                        nested_zip_data = BytesIO(target_zip_stream.read())
-                    self.target_zip[worker].close()
-                    self.target_zip[worker] = zipfile.ZipFile(nested_zip_data)
+                src = _open_source(self.target_zip_path)
+                # nested zip inside zip (original behaviour, only for actual zips)
+                if self.target_zip_path_in_zip and isinstance(src, zipfile.ZipFile):
+                    with src.open(str(self.target_zip_path_in_zip)) as nested:
+                        nested_data = BytesIO(nested.read())
+                    src.close()
+                    src = zipfile.ZipFile(nested_data)
+                self.target_zip[worker_id] = src
             else:
-                self.target_zip[worker] = self.zip[worker]
+                self.target_zip[worker_id] = self.zip[worker_id]
+
+        # --- instance target source (optional) ---
         if (
             self.target_instance_zip_path is not None
-            and worker not in self.target_instance_zip
+            and worker_id not in self.target_instance_zip
         ):
-            self.target_instance_zip[worker] = zipfile.ZipFile(
-                self.target_instance_zip_path
-            )
+            self.target_instance_zip[worker_id] = _open_source(self.target_instance_zip_path)
 
         return (
-            self.zip[worker],
-            self.target_zip[worker],
-            self.target_instance_zip[worker] if self.target_instance_zip_path else None,
+            self.zip[worker_id],
+            self.target_zip[worker_id],
+            self.target_instance_zip[worker_id] if self.target_instance_zip_path else None,
         )
 
-    @staticmethod
-    def _sort_key(m: zipfile.ZipInfo):
-        match = re.search(r"\d+", m.filename)
+    # -----------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------
 
-        return (int(match.group()) if match else float("inf"), m.filename)
+    @staticmethod
+    def _sort_key(m):
+        filename = m.filename if hasattr(m, "filename") else str(m)
+        match = re.search(r"\d+", filename)
+        return (int(match.group()) if match else float("inf"), filename)
 
     @staticmethod
     def valid_member(
-        img_info: zipfile.ZipInfo,
+        img_info,
         img_folder_path_in_zip: Path,
         img_stem_suffix: str,
         img_suffix: str,
@@ -281,21 +353,19 @@ class Dataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.imgs)
 
+    # -----------------------------------------------------------------------
+    # Cleanup
+    # -----------------------------------------------------------------------
+
     def close(self):
-        if self.zip is not None:
-            for item in self.zip.values():
-                item.close()
-            self.zip = None
+        for store in (self.zip, self.target_zip, self.target_instance_zip):
+            if store is not None:
+                for handle in store.values():
+                    handle.close()
 
-        if self.target_zip is not None:
-            for item in self.target_zip.values():
-                item.close()
-            self.target_zip = None
-
-        if self.target_instance_zip is not None:
-            for item in self.target_instance_zip.values():
-                item.close()
-            self.target_instance_zip = None
+        self.zip = None
+        self.target_zip = None
+        self.target_instance_zip = None
 
     def __del__(self):
         self.close()
